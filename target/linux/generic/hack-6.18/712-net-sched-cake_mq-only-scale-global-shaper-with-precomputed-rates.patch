@@ -1,0 +1,169 @@
+From d1afbaf58fc7c4bb3a9b63e8c6a5727e3dc247bd Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jonas=20K=C3=B6ppeler?= <j.koeppeler@tu-berlin.de>
+Date: Sun, 14 Jun 2026 11:24:14 +0200
+Subject: [PATCH] net/sched: cake_mq: only scale global shaper with precomputed
+ rates
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Instead of reconfiguring all tins during the cake_mq sync, only scale
+tin[0] (best effort) and the global shaper. Other tins keep their
+original rate caps based on the full link rate.
+
+This fixes a bandwidth allocation issue in diffserv modes: previously,
+all tin rates were divided equally among active queues, which
+proportionally reduced the rate caps of non-best-effort tins. For
+example, with diffserv3 on a 1 Gbit link and 2 active queues, the
+voice tin cap dropped from 250 Mbit to 125 Mbit. Now the voice tin
+retains its full 250 Mbit cap, and only the global shaper (set to
+500 Mbit) limits total per-queue throughput.
+
+The effective per-tin rate is min(tin_rate, global_rate), so:
+ - Best effort: min(1000, 500) = 500 Mbit (scaled by global shaper)
+ - Voice:       min(250, 500)  = 250 Mbit (preserved original cap)
+
+Additionally, precompute rate tables at init time so the dequeue sync
+path uses a simple table lookup instead of expensive div64_u64
+operations. The sync now only runs when the active queue count
+actually changes, eliminating unnecessary work in steady state.
+
+Signed-off-by: Jonas Köppeler <j.koeppeler@tu-berlin.de>
+---
+ net/sched/sch_cake.c | 81 +++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 72 insertions(+), 9 deletions(-)
+
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -201,11 +201,18 @@
+ 	u32	way_collisions;
+ }; /* number of tins is small, so size of this struct doesn't matter much */
+ 
++struct cake_rate_config {
++	u64 rate;
++	u64 rate_ns;
++	u8  rate_shft;
++};
++
+ struct cake_sched_config {
+ 	u64		rate_bps;
+ 	u64		interval;
+ 	u64		target;
+ 	u64		sync_time;
++	struct cake_rate_config *global_rate_precompute;
+ 	u32		buffer_config_limit;
+ 	u32		fwmark_mask;
+ 	u16		fwmark_shft;
+@@ -2025,7 +2032,6 @@
+ 	    now - q->last_checked_active >= g_sync_time_ns) {
+ 		struct net_device *dev = qdisc_dev(sch);
+ 		struct cake_sched_data *other_priv;
+-		u64 new_rate = q->config->rate_bps;
+ 		u64 other_qlen, other_last_active;
+ 		struct Qdisc *other_sch;
+ 		u32 num_active_qs = 1;
+@@ -2045,15 +2051,25 @@
+ 				num_active_qs++;
+ 		}
+ 
+-		if (num_active_qs > 1)
+-			new_rate = div64_u64(q->config->rate_bps, num_active_qs);
++		if (q->active_queues != num_active_qs) {
++			struct cake_rate_config *rc;
+ 
+-		/* mtu = 0 is used to only update the rate and not mess with cobalt params */
+-		cake_set_rate(b, new_rate, 0, 0, 0);
++			/* Only scale tin[0] and the global shaper.
++			 * Other tins keep their original rate caps so
++			 * that e.g. voice traffic retains its full
++			 * bandwidth regardless of queue sharing.
++			 */
++			rc = &q->config->global_rate_precompute[num_active_qs - 1];
++			WRITE_ONCE(q->tins[0].flow_quantum,
++				   max(min(rc->rate >> 12, 1514ULL), 300ULL));
++			WRITE_ONCE(q->tins[0].tin_rate_bps, rc->rate);
++			q->tins[0].tin_rate_ns   = rc->rate_ns;
++			q->tins[0].tin_rate_shft = rc->rate_shft;
++			q->rate_ns   = rc->rate_ns;
++			q->rate_shft = rc->rate_shft;
++			WRITE_ONCE(q->active_queues, num_active_qs);
++		}
+ 		q->last_checked_active = now;
+-		q->active_queues = num_active_qs;
+-		q->rate_ns = b->tin_rate_ns;
+-		q->rate_shft = b->tin_rate_shft;
+ 	}
+ 
+ begin:
+@@ -3258,9 +3274,51 @@
+ 
+ static void cake_mq_destroy(struct Qdisc *sch)
+ {
++	struct cake_mq_sched *q = qdisc_priv(sch);
++
++	kvfree(q->cake_config.global_rate_precompute);
+ 	mq_destroy_common(sch);
+ }
+ 
++static void cake_precompute_rate(struct cake_rate_config *rc, u64 rate)
++{
++	static const u64 MIN_RATE = 64;
++	u8  rate_shft = 34;
++	u64 rate_ns;
++
++	rate_ns = ((u64)NSEC_PER_SEC) << rate_shft;
++	rate_ns = div64_u64(rate_ns, max(MIN_RATE, rate));
++	while (!!(rate_ns >> 34)) {
++		rate_ns >>= 1;
++		rate_shft--;
++	}
++
++	rc->rate = rate;
++	rc->rate_ns = rate_ns;
++	rc->rate_shft = rate_shft;
++}
++
++static void cake_precompute_global_rates_fill(struct cake_sched_config *cfg,
++					      u32 num_tx_queues)
++{
++	for (u32 i = 0; i < num_tx_queues; i++)
++		cake_precompute_rate(&cfg->global_rate_precompute[i],
++				     div64_u64(cfg->rate_bps, i + 1));
++}
++
++static int cake_precompute_global_rates(struct cake_sched_config *cfg,
++					u32 num_tx_queues)
++{
++	cfg->global_rate_precompute = kvzalloc_objs(struct cake_rate_config,
++						    num_tx_queues,
++						    GFP_KERNEL);
++	if (!cfg->global_rate_precompute)
++		return -ENOMEM;
++
++	cake_precompute_global_rates_fill(cfg, num_tx_queues);
++	return 0;
++}
++
+ static int cake_mq_init(struct Qdisc *sch, struct nlattr *opt,
+ 			struct netlink_ext_ack *extack)
+ {
+@@ -3280,6 +3338,10 @@
+ 	if (ret)
+ 		return ret;
+ 
++	ret = cake_precompute_global_rates(&priv->cake_config, dev->num_tx_queues);
++	if (ret)
++		return ret;
++
+ 	for (ntx = 0; ntx < dev->num_tx_queues; ntx++)
+ 		cake_config_replace(priv->mq_priv.qdiscs[ntx], &priv->cake_config);
+ 
+@@ -3307,6 +3369,8 @@
+ 	if (ret)
+ 		return ret;
+ 
++	cake_precompute_global_rates_fill(&priv->cake_config, dev->num_tx_queues);
++
+ 	for (ntx = 0; ntx < dev->num_tx_queues; ntx++) {
+ 		struct Qdisc *chld = rtnl_dereference(netdev_get_tx_queue(dev, ntx)->qdisc_sleeping);
+ 		struct cake_sched_data *qd = qdisc_priv(chld);
