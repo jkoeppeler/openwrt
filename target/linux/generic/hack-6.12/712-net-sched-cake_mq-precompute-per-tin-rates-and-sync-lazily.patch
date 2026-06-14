@@ -1,0 +1,289 @@
+From d07442ab99bcdeca75c8660d18785a7fdb89ba11 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jonas=20K=C3=B6ppeler?= <j.koeppeler@tu-berlin.de>
+Date: Sat, 13 Jun 2026 12:25:57 +0200
+Subject: [PATCH] net/sched: cake_mq: precompute per-tin rates and sync lazily
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The cake_mq dequeue path periodically counts active tx queues and
+reconfigures all tin rates via cake_configure_rates(), which involves
+expensive div64_u64 operations and writes to every tin's data structure
+on each sync interval. This caused measurable performance degradation,
+especially on low-end hardware with short sync times.
+
+Precompute rate tables at qdisc init time for each tin and each
+possible active queue count. During the dequeue sync check, instead of
+eagerly reconfiguring all tins, just bump a per-qdisc generation
+counter when active_queues changes.
+
+Each tin tracks the last generation it was synced to. When a tin is
+accessed during enqueue (cake_select_tin) or dequeue, its generation
+is compared against the qdisc's current generation. Only stale tins
+get their rate fields updated from the precomputed lookup table; idle
+tins are never touched.
+
+This reduces the sync cost from O(tins * div64 + tin writes) on every
+transition to a single generation check per tin access, with the
+actual rate update deferred to the point of use. For diffserv3 where
+most traffic hits Best Effort, typically only one tin is updated.
+
+Signed-off-by: Jonas Köppeler <j.koeppeler@tu-berlin.de>
+---
+ net/sched/sch_cake.c | 165 +++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 159 insertions(+), 6 deletions(-)
+
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -158,6 +158,7 @@
+ 	u16	overflow_idx[CAKE_QUEUES];
+ 	struct cake_host hosts[CAKE_QUEUES]; /* for triple isolation */
+ 	u16	flow_quantum;
++	u32	rate_generation;
+ 
+ 	struct cobalt_params cparams;
+ 	u32	drop_overlimit;
+@@ -201,11 +202,18 @@
+ 	u32	way_collisions;
+ }; /* number of tins is small, so size of this struct doesn't matter much */
+ 
++struct cake_rate_config {
++	u64 rate;
++	u64 rate_ns;
++	u8  rate_shft;
++};
++
+ struct cake_sched_config {
+ 	u64		rate_bps;
+ 	u64		interval;
+ 	u64		target;
+ 	u64		sync_time;
++	struct cake_rate_config *rates_precompute[CAKE_MAX_TINS];
+ 	u32		buffer_config_limit;
+ 	u32		fwmark_mask;
+ 	u16		fwmark_shft;
+@@ -268,6 +276,7 @@
+ 	u64		last_checked_active;
+ 	u64		last_active;
+ 	u32		active_queues;
++	u32		rate_generation;
+ };
+ 
+ enum {
+@@ -1677,6 +1686,36 @@
+ 	}
+ }
+ 
++static void cake_tin_sync_rate(struct cake_sched_data *qd,
++			      struct cake_tin_data *b, int tin)
++{
++	struct cake_sched_config *cfg = qd->config;
++	u32 gen = qd->rate_generation;
++	struct cake_rate_config *rc;
++	u32 idx;
++
++	if (likely(b->rate_generation == gen) || !cfg->is_shared)
++		return;
++
++	idx = max(qd->active_queues, 1U) - 1;
++	rc = &cfg->rates_precompute[tin][idx];
++
++	WRITE_ONCE(b->flow_quantum, max(min(rc->rate >> 12, 1514ULL), 300ULL));
++	b->tin_rate_bps  = rc->rate;
++	b->tin_rate_ns   = rc->rate_ns;
++	b->tin_rate_shft = rc->rate_shft;
++
++	/* Tin 0 is always the fastest and drives the global shaper.
++	 * Update unconditionally so the global rate stays current
++	 * even when tin 0 itself isn't carrying traffic.
++	 */
++	rc = &cfg->rates_precompute[0][idx];
++	qd->rate_ns   = rc->rate_ns;
++	qd->rate_shft = rc->rate_shft;
++
++	b->rate_generation = gen;
++}
++
+ static struct cake_tin_data *cake_select_tin(struct Qdisc *sch,
+ 					     struct sk_buff *skb)
+ {
+@@ -1715,6 +1754,7 @@
+ 			tin = 0;
+ 	}
+ 
++	cake_tin_sync_rate(qd, &qd->tins[tin], tin);
+ 	return &qd->tins[tin];
+ }
+ 
+@@ -2025,7 +2065,6 @@
+ 	    now - q->last_checked_active >= g_sync_time_ns) {
+ 		struct net_device *dev = qdisc_dev(sch);
+ 		struct cake_sched_data *other_priv;
+-		u64 new_rate = q->config->rate_bps;
+ 		u64 other_qlen, other_last_active;
+ 		struct Qdisc *other_sch;
+ 		u32 num_active_qs = 1;
+@@ -2045,12 +2084,11 @@
+ 				num_active_qs++;
+ 		}
+ 
+-		if (num_active_qs > 1)
+-			new_rate = div64_u64(q->config->rate_bps, num_active_qs);
+-
+-		cake_configure_rates(sch, new_rate, true);
++		if (q->active_queues != num_active_qs) {
++			WRITE_ONCE(q->active_queues, num_active_qs);
++			q->rate_generation++;
++		}
+ 		q->last_checked_active = now;
+-		q->active_queues = num_active_qs;
+ 	}
+ 
+ begin:
+@@ -2131,6 +2169,8 @@
+ 			return NULL;
+ 	}
+ 
++	cake_tin_sync_rate(q, b, q->cur_tin);
++
+ retry:
+ 	/* service this class */
+ 	head = &b->decaying_flows;
+@@ -3254,9 +3294,117 @@
+ 
+ static void cake_mq_destroy(struct Qdisc *sch)
+ {
++	struct cake_mq_sched *q = qdisc_priv(sch);
++
++	for (int i = 0; i < CAKE_MAX_TINS; i++)
++		kvfree(q->cake_config.rates_precompute[i]);
+ 	mq_destroy_common(sch);
+ }
+ 
++static void _cake_precompute_rate(struct cake_rate_config *rate_conf, u64 rate)
++{
++	static const u64 MIN_RATE = 64;
++	u8  rate_shft = 0;
++	u64 rate_ns = 0;
++
++	rate_shft = 34;
++	rate_ns = ((u64)NSEC_PER_SEC) << rate_shft;
++	rate_ns = div64_u64(rate_ns, max(MIN_RATE, rate));
++	while (!!(rate_ns >> 34)) {
++		rate_ns >>= 1;
++		rate_shft--;
++	}
++
++	rate_conf->rate = rate;
++	rate_conf->rate_ns = rate_ns;
++	rate_conf->rate_shft = rate_shft;
++}
++
++static void _cake_precompute_besteffort(struct cake_sched_config *cfg,
++					u64 idx, u64 rate)
++{
++	_cake_precompute_rate(&cfg->rates_precompute[0][idx], rate);
++}
++
++static void _cake_precompute_precedence_diffserv8(struct cake_sched_config *cfg,
++					u64 idx, u64 rate)
++{
++	for (int i = 0; i < CAKE_MAX_TINS; i++) {
++		_cake_precompute_rate(&cfg->rates_precompute[i][idx], rate);
++		rate  *= 7;
++		rate >>= 3;
++	}
++}
++
++static void _cake_precompute_diffserv4(struct cake_sched_config *cfg,
++				       u64 idx, u64 rate)
++{
++	_cake_precompute_rate(&cfg->rates_precompute[0][idx], rate);
++	_cake_precompute_rate(&cfg->rates_precompute[1][idx], rate >> 4);
++	_cake_precompute_rate(&cfg->rates_precompute[2][idx], rate >> 1);
++	_cake_precompute_rate(&cfg->rates_precompute[3][idx], rate >> 2);
++}
++
++static void _cake_precompute_diffserv3(struct cake_sched_config *cfg,
++				       u64 idx, u64 rate)
++{
++	_cake_precompute_rate(&cfg->rates_precompute[0][idx], rate);
++	_cake_precompute_rate(&cfg->rates_precompute[1][idx], rate >> 4);
++	_cake_precompute_rate(&cfg->rates_precompute[2][idx], rate >> 2);
++}
++
++static void _cake_precompute_rates(struct cake_sched_config *cfg, u64 cnt)
++{
++	u64 idx = cnt - 1; /* array index 0 = 1 active queue */
++	u64 rate = div64_u64(cfg->rate_bps, cnt);
++
++	switch (cfg->tin_mode) {
++	case CAKE_DIFFSERV_BESTEFFORT:
++		_cake_precompute_besteffort(cfg, idx, rate);
++		break;
++	case CAKE_DIFFSERV_PRECEDENCE:
++	case CAKE_DIFFSERV_DIFFSERV8:
++		_cake_precompute_precedence_diffserv8(cfg, idx, rate);
++		break;
++	case CAKE_DIFFSERV_DIFFSERV4:
++		_cake_precompute_diffserv4(cfg, idx, rate);
++		break;
++	case CAKE_DIFFSERV_DIFFSERV3:
++	default:
++		_cake_precompute_diffserv3(cfg, idx, rate);
++		break;
++	}
++}
++
++static void cake_precompute_rates_fill(struct cake_sched_config *cfg,
++				       u64 num_tx_queues)
++{
++	for (int i = 1; i <= num_tx_queues; i++)
++		_cake_precompute_rates(cfg, i);
++}
++
++static int cake_precompute_rates_alloc(struct cake_sched_config *cfg,
++				       u64 num_tx_queues)
++{
++	for (int i = 0; i < CAKE_MAX_TINS; i++) {
++		cfg->rates_precompute[i] = kvzalloc_objs(struct cake_rate_config,
++							 num_tx_queues,
++							 GFP_KERNEL);
++		if (!cfg->rates_precompute[i])
++			goto err_free;
++	}
++
++	cake_precompute_rates_fill(cfg, num_tx_queues);
++	return 0;
++
++err_free:
++	for (int j = 0; j < CAKE_MAX_TINS; j++) {
++		kvfree(cfg->rates_precompute[j]);
++		cfg->rates_precompute[j] = NULL;
++	}
++	return -ENOMEM;
++}
++
+ static int cake_mq_init(struct Qdisc *sch, struct nlattr *opt,
+ 			struct netlink_ext_ack *extack)
+ {
+@@ -3276,6 +3424,10 @@
+ 	if (ret)
+ 		return ret;
+ 
++	ret = cake_precompute_rates_alloc(&priv->cake_config, dev->num_tx_queues);
++	if (ret)
++		return ret;
++
+ 	for (ntx = 0; ntx < dev->num_tx_queues; ntx++)
+ 		cake_config_replace(priv->mq_priv.qdiscs[ntx], &priv->cake_config);
+ 
+@@ -3303,6 +3455,8 @@
+ 	if (ret)
+ 		return ret;
+ 
++	cake_precompute_rates_fill(&priv->cake_config, dev->num_tx_queues);
++
+ 	for (ntx = 0; ntx < dev->num_tx_queues; ntx++) {
+ 		struct Qdisc *chld = rtnl_dereference(netdev_get_tx_queue(dev, ntx)->qdisc_sleeping);
+ 		struct cake_sched_data *qd = qdisc_priv(chld);
